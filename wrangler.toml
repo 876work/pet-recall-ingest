@@ -1,0 +1,21 @@
+name = "pet-recall-ingest"
+main = "src/index.ts"
+compatibility_date = "2026-08-01"
+
+# Every 6 hours. Recall notices post during business hours; there is no value
+# in polling more often, and it only burns LLM budget on unchanged records.
+[triggers]
+crons = ["0 */6 * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "pet-recall"
+database_id = "31600635-bd12-4298-9314-398c63fc30f1"
+
+# Secrets — set with `wrangler secret put NAME`, never put them in this file:
+#   ANTHROPIC_API_KEY
+#   OPENFDA_API_KEY
+#   ADMIN_TOKEN        (any long random string you generate)
+
+[observability]
+enabled = true

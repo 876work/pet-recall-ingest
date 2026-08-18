@@ -1,0 +1,17 @@
+{
+  "name": "pet-recall-ingest",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:init": "wrangler d1 execute pet-recall --remote --file=./schema.sql",
+    "db:init:local": "wrangler d1 execute pet-recall --local --file=./schema.sql",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250801.0",
+    "typescript": "^5.6.0",
+    "wrangler": "^3.90.0"
+  }
+}

@@ -123,7 +123,10 @@ async function runIngest(env: Env, days = 120) {
     // that block first, not a new field map.
     const sources: Array<[string, () => Promise<RawRecord[]>]> = [
       ['fda', () => fetchOpenFda(env.OPENFDA_API_KEY, days)],
-      ['fda_press', () => fetchFdaPress(days)],
+      // env.DB lets the adapter skip re-fetching a release body it already
+      // holds; without it every run spends 20 subrequests re-reading the same
+      // pages and starves extraction. See the note in fda_press.ts.
+      ['fda_press', () => fetchFdaPress(days, env.DB)],
     ];
 
     // Sources are independent: one being down must not block the other.

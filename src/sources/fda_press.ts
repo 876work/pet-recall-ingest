@@ -58,8 +58,26 @@ const MIN_BODY_CHARS = 400;
  * The fetches are sequential with a pause between them. Twenty pages in
  * parallel is a burst fda.gov has no reason to absorb, and a 6-hourly cron has
  * no deadline that would justify one.
+ *
+ * A body is fetched ONCE. Re-fetching all twenty every run cost twenty
+ * subrequests against a fifty-subrequest invocation ceiling and starved
+ * extraction of the budget it needs — so when `db` is supplied, releases whose
+ * body we already hold are skipped and their stored text reused verbatim.
+ *
+ * Reusing the stored text is not an optimisation, it is the whole correctness
+ * requirement: `description` feeds the content hash in store.ts. Letting the
+ * short RSS blurb through for a record whose stored description is the full
+ * body would read as a change, overwrite the good text with the blurb, and
+ * reset extraction — undoing the fetch on every single run.
+ *
+ * Skipping is safe because FDA publishes a revision as a NEW feed item with a
+ * new slug ("updated-<original-slug>"), which lands as its own record and gets
+ * its own fetch. A slug's body does not change under it.
  */
-export async function fetchFdaPress(sinceDays = 120): Promise<RawRecord[]> {
+export async function fetchFdaPress(
+  sinceDays = 120,
+  db?: D1Database,
+): Promise<RawRecord[]> {
   const res = await fetch(FEED, {
     headers: {
       Accept: 'application/rss+xml, application/xml;q=0.9',
@@ -80,7 +98,7 @@ export async function fetchFdaPress(sinceDays = 120): Promise<RawRecord[]> {
     // Keep anything we could not date rather than silently dropping it.
     .filter((r) => r.recallDate === null || Date.parse(r.recallDate) >= cutoff);
 
-  return withNoticeBodies(records);
+  return withNoticeBodies(records, db);
 }
 
 // ---------------------------------------------------------------------------
@@ -100,11 +118,25 @@ export async function fetchFdaPress(sinceDays = 120): Promise<RawRecord[]> {
  * is re-queued for extraction on its own. A record whose fetch fails keeps the
  * identical blurb, hashes the same, and correctly costs nothing.
  */
-async function withNoticeBodies(records: RawRecord[]): Promise<RawRecord[]> {
+async function withNoticeBodies(
+  records: RawRecord[],
+  db?: D1Database,
+): Promise<RawRecord[]> {
   const out: RawRecord[] = [];
   let fetches = 0;
 
+  // One D1 read in place of up to twenty page fetches.
+  const stored = db ? await storedBodies(db, records) : new Map<string, string>();
+
   for (const rec of records) {
+    // Already held. Reuse the exact stored text so the content hash matches and
+    // store.ts sees 'unchanged' — no rewrite, no re-extraction, no LLM spend.
+    const held = stored.get(rowId(rec));
+    if (held) {
+      out.push(withBodyFlag({ ...rec, description: held }, true));
+      continue;
+    }
+
     if (!rec.url || fetches >= MAX_BODY_FETCHES) {
       out.push(withBodyFlag(rec, false));
       continue;
@@ -124,6 +156,53 @@ async function withNoticeBodies(records: RawRecord[]): Promise<RawRecord[]> {
   }
 
   return out;
+}
+
+/**
+ * Mirrors the id store.ts builds (`${source}:${sourceId}`). Duplicated rather
+ * than imported because store.ts does not export it and must not be changed
+ * for this — same arrangement as the EVENT_KEY copy in notify.ts. If that
+ * expression ever changes, this has to change with it.
+ */
+function rowId(rec: RawRecord): string {
+  return `${rec.source}:${rec.sourceId}`;
+}
+
+/**
+ * The already-fetched body text for whichever of these releases we hold one.
+ *
+ * Keyed on the body_fetched flag rather than on description length: length is a
+ * guess, the flag is a statement this adapter wrote itself. Records predating
+ * the flag come back absent and are simply fetched once more, after which they
+ * carry it.
+ *
+ * A failure here degrades to fetching, which is the previous behaviour and
+ * still correct — never to dropping a record.
+ */
+async function storedBodies(
+  db: D1Database,
+  records: RawRecord[],
+): Promise<Map<string, string>> {
+  const ids = records.map(rowId);
+  if (ids.length === 0) return new Map();
+
+  try {
+    const { results } = await db
+      .prepare(
+        `SELECT id, raw_description
+           FROM recalls
+          WHERE id IN (${ids.map(() => '?').join(',')})
+            AND json_extract(raw_json, '$.body_fetched') = 1
+            AND raw_description IS NOT NULL
+            AND LENGTH(raw_description) >= ?`,
+      )
+      .bind(...ids, MIN_BODY_CHARS)
+      .all<{ id: string; raw_description: string }>();
+
+    return new Map(results.map((r) => [r.id, r.raw_description]));
+  } catch {
+    return new Map();
+  }
 }
 
 /**

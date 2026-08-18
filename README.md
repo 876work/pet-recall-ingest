@@ -58,12 +58,35 @@ Admin, `Authorization: Bearer $ADMIN_TOKEN`:
 | Route | Notes |
 | --- | --- |
 | `GET /admin/ingest` | fetch + upsert + extract; `?days=` window |
-| `GET /admin/extract` | drain the extraction backlog, ≤25 per call |
+| `GET /admin/extract` | drain the extraction backlog; asks for ≤25, see the subrequest note below |
 | `GET /admin/notify` | drain the notify queue, looped |
 | `GET /admin/stats` | corpus counts and the last ingest run |
 
 Cron runs `0 */6 * * *`: ingest, then extract, then notify — in that order,
 because the notifier skips any queued recall that is not extracted yet.
+
+### The subrequest ceiling
+
+A Worker invocation gets **50 subrequests** on the free plan, and one ingest run
+has to fit ingest *and* extraction inside that. `EXTRACT_BATCH` asks for 25
+records, but that is a request, not a guarantee: when the budget runs out the
+remaining records fail with `Too many subrequests by single Worker invocation`
+and park at extraction version 0. Do not read "25 per call" as throughput.
+
+Roughly, per run:
+
+| | subrequests |
+| --- | --- |
+| openFDA pagination | ~6 (100 records per page) |
+| press RSS feed | 1 |
+| press bodies | one per release **whose body we do not already hold** |
+| stored-body lookup | 1 D1 read |
+| extraction | 1 Anthropic call per record, plus its D1 writes |
+
+Fetching every press body on every run cost 20 subrequests and left almost
+nothing for extraction — one run managed 3 records and failed 22. Bodies are
+now fetched once (see below), so steady state spends ~8 before extraction
+begins and new releases are the only ones that cost a page fetch.
 
 Backfill, then check what landed:
 
@@ -117,9 +140,14 @@ SELECT COUNT(DISTINCT recall_id) FROM recall_upcs;
 SELECT COUNT(*) FROM recalls;
 ```
 
-**4. Failed extractions.** These park at version 0 rather than NULL so they stop
-blocking the queue, which also means they stop being visible. Check the count
-periodically — it is not zero:
+**4. Failed extractions.** These park at version 0, and — despite what the
+comment in `store.ts` says — that does **not** take them out of the queue:
+`pendingExtraction` selects `extraction_version IS NULL OR extraction_version <
+EXTRACTION_VERSION`, and `0 < 2`. They are retried on every run, sorted to the
+front by `recall_date DESC`.
+
+That is what makes a budget failure self-healing, and it is also why a record
+that fails for a real reason will retry forever. Check the count periodically:
 
 ```sql
 SELECT COUNT(*) FROM recalls WHERE extraction_version = 0;
@@ -141,6 +169,14 @@ and the whole corpus re-extracts on the next cron. Costs cents.
 and firm — not status. A recall closing does not trigger re-extraction. It also
 means a press release whose body arrives for the first time reads as changed and
 re-queues itself; one whose fetch failed hashes identically and costs nothing.
+
+**A press-release body is fetched once.** After the first fetch the text is
+stored, and later runs reuse it verbatim rather than re-reading the page. The
+reuse has to be verbatim: `description` feeds the content hash, so handing back
+the short RSS blurb for a record whose stored description is the full body would
+read as a change, overwrite the good text, and reset extraction — every run.
+Revisions are not missed, because FDA publishes them as a new feed item with a
+new slug, which arrives as its own record.
 
 **One recall is many rows.** openFDA splits an event across one enforcement
 report per product or lot. The read API and the notifier both group on the same
@@ -178,8 +214,9 @@ Extraction is `claude-haiku-4-5-20251001` at temperature 0 over a few thousand
 tokens per record. The initial backfill was a few dollars; steady state is cents
 per month at 10–30 new records a week. This is not where your money goes.
 
-Ingest also costs one subrequest per press release per run — at most 20, since
-that is the feed window.
+Ingest costs one subrequest per press release whose body is not already
+stored. In steady state that is only the new ones; a run where all twenty feed
+items are already held costs a single D1 read instead.
 
 ## Corpus at time of writing
 

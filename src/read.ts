@@ -407,7 +407,12 @@ async function listBrands(db: D1Database, url: URL) {
   // brands.recall_count is never maintained by the ingest path, so it is
   // counted here — and counted in events, so a brand caught in one 16-report
   // recall reads as one recall rather than sixteen.
-  const where: string[] = ['p.brand_id IS NOT NULL', `NOT ${SUPERSEDED}`];
+  //
+  // SUPERSEDED is a correlated subquery. Inlined into this WHERE it ran once per
+  // joined brand/product row — about 7 s and 40M rows read per statement, so a
+  // cold search took ~14 s. Evaluated once over the press rows as a CTE it is
+  // the same set, for ~0.3 s.
+  const where: string[] = ['p.brand_id IS NOT NULL', 'r.id NOT IN (SELECT id FROM superseded)'];
   const binds: unknown[] = [];
 
   if (q) {
@@ -421,22 +426,27 @@ async function listBrands(db: D1Database, url: URL) {
   }
 
   const whereSql = where.join(' AND ');
+  const supersededCte = `WITH superseded AS MATERIALIZED (
+    SELECT r.id FROM recalls r WHERE r.source = 'fda_press' AND ${SUPERSEDED}
+  )`;
 
-  const totalRow = await db
-    .prepare(
-      `SELECT COUNT(*) AS n FROM (
+  // One round trip for both statements.
+  const [totalResult, pageResult] = await db.batch([
+    db
+      .prepare(
+        `${supersededCte}
+       SELECT COUNT(*) AS n FROM (
          SELECT b.id FROM brands b
            JOIN recall_products p ON p.brand_id = b.id
            JOIN recalls r ON r.id = p.recall_id
           WHERE ${whereSql}
           GROUP BY b.id)`,
-    )
-    .bind(...binds)
-    .first<{ n: number }>();
-
-  const { results } = await db
-    .prepare(
-      `SELECT b.id, b.canonical_name, b.normalized_name,
+      )
+      .bind(...binds),
+    db
+      .prepare(
+        `${supersededCte}
+       SELECT b.id, b.canonical_name, b.normalized_name,
               COUNT(DISTINCT ${EVENT_KEY}) AS recall_count,
               COUNT(DISTINCT p.recall_id) AS report_count,
               MAX(r.recall_date) AS latest_recall_date,
@@ -448,19 +458,20 @@ async function listBrands(db: D1Database, url: URL) {
         GROUP BY b.id
         ORDER BY recall_count DESC, b.canonical_name ASC
         LIMIT ? OFFSET ?`,
-    )
-    .bind(...binds, limit, offset)
-    .all<{
-      id: number;
-      canonical_name: string;
-      normalized_name: string;
-      recall_count: number;
-      report_count: number;
-      latest_recall_date: string | null;
-      categories: string | null;
-    }>();
+      )
+      .bind(...binds, limit, offset),
+  ]);
 
-  const total = totalRow?.n ?? 0;
+  const results = pageResult.results as {
+    id: number;
+    canonical_name: string;
+    normalized_name: string;
+    recall_count: number;
+    report_count: number;
+    latest_recall_date: string | null;
+    categories: string | null;
+  }[];
+  const total = (totalResult.results[0] as { n: number } | undefined)?.n ?? 0;
 
   return {
     brands: results.map((b) => ({

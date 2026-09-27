@@ -515,7 +515,18 @@ interface RecordRow {
   states: string | null;
   url: string | null;
   extraction_confidence: string | null;
+  code_info: string | null;
+  termination_date: string | null;
 }
+
+/**
+ * The FDA's own code text for a report, capped. The app's lot matcher uses it
+ * to tell whether the extracted lot list is the whole story: a notice that
+ * says "all batch codes starting with 2C" extracts to the single token "2C",
+ * and only the original text shows that other lots are covered too. Server to
+ * app only; nothing about the user is sent the other way.
+ */
+const CODE_INFO_MAX = 4000;
 
 interface ProductOut {
   brand: string | null;
@@ -552,6 +563,11 @@ interface RecallEvent {
     status: string | null;
     recall_date: string | null;
     upcs: string[];
+    /** FDA code_info (+ more_code_info), capped at CODE_INFO_MAX. */
+    code_info: string | null;
+    code_info_truncated: boolean;
+    /** FDA termination date, YYYY-MM-DD, when the FDA has terminated it. */
+    termination_date: string | null;
   }>;
   also_reported_by: Array<{ id: string; source: string; url: string | null }>;
 }
@@ -574,7 +590,10 @@ async function loadEvents(
     (ph) =>
       `SELECT ${EVENT_KEY} AS event_key, r.id, r.source, r.source_id, r.title,
               r.category, r.species, r.classification, r.status, r.recall_date,
-              r.recalling_firm, r.states, r.url, r.extraction_confidence
+              r.recalling_firm, r.states, r.url, r.extraction_confidence,
+              TRIM(COALESCE(json_extract(r.raw_json, '$.code_info'), '') || ' ' ||
+                   COALESCE(json_extract(r.raw_json, '$.more_code_info'), '')) AS code_info,
+              json_extract(r.raw_json, '$.termination_date') AS termination_date
          FROM recalls r
         WHERE ${EVENT_KEY} IN (${ph})
         ORDER BY r.recall_date DESC, r.source_id ASC`,
@@ -708,6 +727,9 @@ function buildEvent(
       status: r.status,
       recall_date: r.recall_date,
       upcs: (upcsBy.get(r.id) ?? []).map((u) => u.upc),
+      code_info: r.code_info ? r.code_info.slice(0, CODE_INFO_MAX) : null,
+      code_info_truncated: Boolean(r.code_info && r.code_info.length > CODE_INFO_MAX),
+      termination_date: isoDate(r.termination_date),
     })),
     also_reported_by: alsoBy
       .map((d) => dupById.get(d.duplicate_id))
@@ -810,6 +832,12 @@ function uniq<T>(items: T[]): T[] {
 
 function placeholders(n: number): string {
   return new Array(n).fill('?').join(',');
+}
+
+/** openFDA dates are YYYYMMDD; anything else is dropped rather than guessed. */
+function isoDate(raw: string | null): string | null {
+  const m = raw ? /^(\d{4})(\d{2})(\d{2})$/.exec(raw) : null;
+  return m ? `${m[1]}-${m[2]}-${m[3]}` : null;
 }
 
 function jsonArray(raw: string | null): string[] {

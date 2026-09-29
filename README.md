@@ -44,9 +44,20 @@ enhanced push security. Unset, delivery is unauthenticated as normal.
 
 Public, no auth — the app has no account to authenticate with:
 
+`GET /recalls/search` searches extracted public title, identifier, event ID,
+product, brand, recalling firm, reason and exact UPC fields. It returns grouped
+recall events with the same nested products/variants shape as `/recalls` and
+uses `limit`/`offset` paging (25 by default, 100 maximum). Exact IDs and UPCs
+rank first, then product/brand phrases, then firm/reason matches. Empty `q` is
+rejected. Search terms are not logged. Text matching uses the existing D1
+recall, product and brand tables; exact UPC matching uses the existing UPC
+index. The current corpus is a few thousand rows, so substring matches use
+bounded table scans instead of an additional full-text index.
+
 | Route | Notes |
 | --- | --- |
 | `GET /recalls` | filtered feed; edge-cached |
+| `GET /recalls/search?q=...` | paginated public recall-event search; 60-second edge cache; category, classification, status and source filters |
 | `GET /brands` | brand list for following |
 | `GET /upc/:code` | barcode lookup, tiered `upc_exact` → `brand_product` → `brand_only` |
 | `POST /devices/register` | full mirror of one device's brands and pantry barcodes |

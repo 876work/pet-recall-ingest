@@ -19,6 +19,7 @@ const DEFAULT_LIMIT = 25;
 const MAX_LIMIT = 100;
 const MAX_TIER_MATCHES = 20;
 const CACHE_SECONDS = 300;
+const SEARCH_CACHE_SECONDS = 60;
 
 /** How far apart two reports of the same recall may sit before we stop merging. */
 const MERGE_WINDOW_DAYS = 90;
@@ -87,7 +88,7 @@ export async function handleRead(
   if (req.method !== 'GET' && req.method !== 'HEAD') return null;
 
   const path = url.pathname;
-  const isRead = path === '/recalls' || path === '/brands' || path.startsWith('/upc/');
+  const isRead = path === '/recalls' || path === '/recalls/search' || path === '/brands' || path.startsWith('/upc/');
   if (!isRead) return null;
 
   const cache = caches.default;
@@ -96,7 +97,9 @@ export async function handleRead(
 
   let res: Response;
   try {
-    if (path === '/recalls') {
+    if (path === '/recalls/search') {
+      res = json(await searchRecalls(env.DB, url), 200, SEARCH_CACHE_SECONDS);
+    } else if (path === '/recalls') {
       res = json(await listRecalls(env.DB, url));
     } else if (path === '/brands') {
       res = json(await listBrands(env.DB, url));
@@ -105,12 +108,124 @@ export async function handleRead(
     }
   } catch (err) {
     // A read failure must not surface as a bare 1101 either.
+    if (err instanceof SearchQueryError) return json({ error: err.message }, 400);
     return json({ error: err instanceof Error ? err.message : String(err) }, 500);
   }
 
   if (res.status === 200) ctx.waitUntil(cache.put(req, res.clone()));
   return res;
 }
+
+// ---------------------------------------------------------------------------
+// GET /recalls/search
+// ---------------------------------------------------------------------------
+
+async function searchRecalls(db: D1Database, url: URL) {
+  const rawQuery = url.searchParams.get('q') ?? '';
+  const query = rawQuery.normalize('NFKC').trim().slice(0, 120);
+  if (!query) throw new SearchQueryError('A non-empty q parameter is required.');
+
+  const limit = clampInt(url.searchParams.get('limit'), DEFAULT_LIMIT, 1, MAX_LIMIT);
+  const offset = clampInt(url.searchParams.get('offset'), 0, 0, 1_000_000);
+  const category = url.searchParams.get('category')?.trim() || null;
+  const classification = url.searchParams.get('classification')?.trim() || null;
+  const status = url.searchParams.get('status')?.trim() || null;
+  const source = url.searchParams.get('source')?.trim() || null;
+  const terms = query.toLocaleLowerCase().split(/\s+/).filter(Boolean).slice(0, 6);
+  const normalizedQueryUpc = /^[\d -]+$/.test(query) ? normalizeUpc(query) : null;
+  const numericIdentifier = /^\d{8,14}$/.test(query) || normalizedQueryUpc !== null;
+  const exactUpc = numericIdentifier ? normalizedQueryUpc ?? query : null;
+  const dups = await duplicatePairs(db);
+
+  const where = [
+    'r.extraction_version IS NOT NULL',
+    'r.id NOT IN (SELECT id FROM superseded)',
+  ];
+  const filterBinds: unknown[] = [];
+  if (category) { where.push('r.category = ?'); filterBinds.push(category); }
+  if (classification) { where.push('LOWER(COALESCE(r.classification, \'\')) = LOWER(?)'); filterBinds.push(classification); }
+  if (status) { where.push('LOWER(COALESCE(r.status, \'\')) = LOWER(?)'); filterBinds.push(status); }
+  if (source) { where.push('LOWER(r.source) = LOWER(?)'); filterBinds.push(source); }
+
+  const escaped = (value: string) => `%${value.replace(/[\\%_]/g, '\\$&')}%`;
+  const tokenClauses = terms.map(() => `(
+    LOWER(COALESCE(r.title, '')) LIKE ? ESCAPE '\\'
+    OR LOWER(COALESCE(r.id, '')) LIKE ? ESCAPE '\\'
+    OR LOWER(COALESCE(r.source_id, '')) LIKE ? ESCAPE '\\'
+    OR LOWER(COALESCE(json_extract(r.raw_json, '$.event_id'), '')) LIKE ? ESCAPE '\\'
+    OR LOWER(COALESCE(r.recalling_firm, '')) LIKE ? ESCAPE '\\'
+    OR LOWER(COALESCE(r.reason, '')) LIKE ? ESCAPE '\\'
+    OR EXISTS (
+      SELECT 1 FROM recall_products p LEFT JOIN brands b ON b.id = p.brand_id
+       WHERE p.recall_id = r.id AND (
+         LOWER(COALESCE(p.product_name, '')) LIKE ? ESCAPE '\\'
+         OR LOWER(COALESCE(p.brand_raw, '')) LIKE ? ESCAPE '\\'
+         OR LOWER(COALESCE(b.canonical_name, '')) LIKE ? ESCAPE '\\'
+       )
+    )
+  )`);
+  const exactClause = `(
+    LOWER(r.id) = LOWER(?) OR LOWER(r.source_id) = LOWER(?)
+    OR LOWER(COALESCE(json_extract(r.raw_json, '$.event_id'), '')) = LOWER(?)
+    ${exactUpc ? 'OR EXISTS (SELECT 1 FROM recall_upcs exact_upc WHERE exact_upc.recall_id = r.id AND exact_upc.upc = ?)' : ''}
+  )`;
+  const exactFilterBinds: unknown[] = [];
+  if (numericIdentifier) {
+    where.push(exactClause);
+    exactFilterBinds.push(query, query, query);
+    if (exactUpc) exactFilterBinds.push(exactUpc);
+  } else {
+    where.push(tokenClauses.join(' AND '));
+  }
+
+  const productPhraseClause = `EXISTS (
+    SELECT 1 FROM recall_products pp LEFT JOIN brands bb ON bb.id = pp.brand_id
+     WHERE pp.recall_id = r.id AND (
+       LOWER(COALESCE(pp.product_name, '')) LIKE ? ESCAPE '\\'
+       OR LOWER(COALESCE(pp.brand_raw, '')) LIKE ? ESCAPE '\\'
+       OR LOWER(COALESCE(bb.canonical_name, '')) LIKE ? ESCAPE '\\'
+     )
+  )`;
+  const matchBinds = numericIdentifier ? [] : terms.flatMap((term) => Array(9).fill(escaped(term)));
+  const rankBinds: unknown[] = [query, query, query];
+  if (exactUpc) rankBinds.push(exactUpc);
+  rankBinds.push(escaped(query), escaped(query), escaped(query));
+
+  const baseCte = `WITH superseded AS MATERIALIZED (
+    SELECT r.id FROM recalls r WHERE r.source = 'fda_press' AND ${SUPERSEDED}
+  ), matching AS (
+    SELECT ${EVENT_KEY} AS event_key, MAX(r.recall_date) AS sort_date,
+           MIN(CASE WHEN ${exactClause} THEN 0 WHEN ${productPhraseClause} THEN 1 ELSE 2 END) AS relevance
+      FROM recalls r
+     WHERE ${[...where].join(' AND ')}
+     GROUP BY event_key
+  )`;
+  const binds = [...rankBinds, ...filterBinds, ...exactFilterBinds, ...matchBinds];
+  const [totalResult, pageResult] = await db.batch([
+    db.prepare(`${baseCte} SELECT COUNT(*) AS n FROM matching`).bind(...binds),
+    db.prepare(`${baseCte}
+      SELECT event_key, sort_date FROM matching
+       ORDER BY relevance ASC, sort_date DESC, event_key DESC
+       LIMIT ? OFFSET ?`).bind(...binds, limit, offset),
+  ]);
+  const rows = pageResult.results as Array<{ event_key: string; sort_date: string | null }>;
+  const events = await loadEvents(db, rows.map((row) => row.event_key), dups);
+  const total = (totalResult.results[0] as { n: number } | undefined)?.n ?? 0;
+
+  return {
+    recalls: events,
+    page: {
+      limit, offset, total, returned: events.length,
+      has_more: offset + events.length < total,
+      next_offset: offset + events.length < total ? offset + events.length : null,
+    },
+    filters: { q: query, category, classification, status, source },
+    grouping: 'event',
+    merged_duplicates: dups.length,
+  };
+}
+
+class SearchQueryError extends Error {}
 
 // ---------------------------------------------------------------------------
 // Cross-source de-duplication
@@ -856,12 +971,12 @@ function clampInt(raw: string | null, fallback: number, min: number, max: number
   return Math.min(Math.max(Math.trunc(n), min), max);
 }
 
-function json(body: unknown, status = 200): Response {
+function json(body: unknown, status = 200, cacheSeconds = CACHE_SECONDS): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: {
       'Content-Type': 'application/json; charset=utf-8',
-      'Cache-Control': status === 200 ? `public, max-age=${CACHE_SECONDS}` : 'no-store',
+      'Cache-Control': status === 200 ? `public, max-age=${cacheSeconds}` : 'no-store',
       'Access-Control-Allow-Origin': '*',
     },
   });

@@ -7,7 +7,8 @@
     "deploy": "wrangler deploy",
     "db:init": "wrangler d1 execute pet-recall --remote --file=./schema.sql",
     "db:init:local": "wrangler d1 execute pet-recall --local --file=./schema.sql",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:search": "node --disable-warning=ExperimentalWarning --test tests/search.test.cjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250801.0",

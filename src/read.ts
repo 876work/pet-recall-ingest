@@ -134,6 +134,10 @@ async function searchRecalls(db: D1Database, url: URL) {
   const terms = query.toLocaleLowerCase().split(/\s+/).filter(Boolean).slice(0, 6);
   const normalizedQueryUpc = /^[\d -]+$/.test(query) ? normalizeUpc(query) : null;
   const numericIdentifier = /^\d{8,14}$/.test(query) || normalizedQueryUpc !== null;
+  // FDA press-release IDs are long slugs. Matching those through SQLite's
+  // wildcard engine can exceed its pattern complexity limit; compare the
+  // indexed identifier fields directly instead.
+  const longIdentifier = query.length >= 48 && /^[a-z0-9:_-]+$/i.test(query);
   const exactUpc = numericIdentifier ? normalizedQueryUpc ?? query : null;
   const dups = await duplicatePairs(db);
 
@@ -170,7 +174,7 @@ async function searchRecalls(db: D1Database, url: URL) {
     ${exactUpc ? 'OR EXISTS (SELECT 1 FROM recall_upcs exact_upc WHERE exact_upc.recall_id = r.id AND exact_upc.upc = ?)' : ''}
   )`;
   const exactFilterBinds: unknown[] = [];
-  if (numericIdentifier) {
+  if (numericIdentifier || longIdentifier) {
     where.push(exactClause);
     exactFilterBinds.push(query, query, query);
     if (exactUpc) exactFilterBinds.push(exactUpc);
@@ -186,7 +190,7 @@ async function searchRecalls(db: D1Database, url: URL) {
        OR LOWER(COALESCE(bb.canonical_name, '')) LIKE ? ESCAPE '\\'
      )
   )`;
-  const matchBinds = numericIdentifier ? [] : terms.flatMap((term) => Array(9).fill(escaped(term)));
+  const matchBinds = numericIdentifier || longIdentifier ? [] : terms.flatMap((term) => Array(9).fill(escaped(term)));
   const rankBinds: unknown[] = [query, query, query];
   if (exactUpc) rankBinds.push(exactUpc);
   rankBinds.push(escaped(query), escaped(query), escaped(query));

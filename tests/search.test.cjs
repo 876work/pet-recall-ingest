@@ -41,6 +41,7 @@ const fixtures = [
   { id: 'fda:F-2026-101', sourceId: 'F-2026-101', event: '101', title: 'Chicken Dinner Recall', firm: 'Home Pantry Co', reason: 'Packaging defect', product: 'Chicken Dinner', brand: 'Purina', upc: '012345678912', category: 'pet_food', classification: 'Class II', status: 'ongoing', source: 'fda' },
   { id: 'fda:F-2026-102', sourceId: 'F-2026-102', event: '102', title: 'Salmon Meal Recall', firm: 'Ocean Kitchens', reason: 'Listeria concern', product: 'Salmon Meal', brand: 'Blue Bay', upc: '012345678929', category: 'human_food', classification: 'Class II', status: 'terminated', source: 'fda' },
   { id: 'fda_press:press-103', sourceId: 'press-103', event: null, title: 'Chicken Treat Recall', firm: 'Small Farm', reason: 'Salmonella found', product: 'Chicken Treats', brand: 'North Farm', upc: '012345678936', category: 'pet_food', classification: 'Class III', status: 'ongoing', source: 'fda_press' },
+  { id: 'fda_press:freshpoint-issues-recall-due-improperly-declared-allergen-egg-chicken-salad-wedge-sandwiches', sourceId: 'freshpoint-issues-recall-due-improperly-declared-allergen-egg-chicken-salad-wedge-sandwiches', event: null, title: 'FreshPoint Recall', firm: 'FreshPoint', reason: 'Undeclared allergen', product: 'Wedge Sandwich', brand: 'FreshPoint', upc: '012345678950', category: 'human_food', classification: 'Class I', status: 'ongoing', source: 'fda_press' },
   { id: 'fda:F-2026-104', sourceId: 'F-2026-104', event: '104', title: 'Turkey Formula Recall', firm: 'Fresh Pet Co', reason: 'Labeling issue', product: 'Turkey Formula', brand: 'Fresh Paws', upc: '012345678943', category: 'pet_food', classification: 'Class II', status: 'completed', source: 'fda' },
 ];
 
@@ -106,13 +107,15 @@ test('exact UPC and recall identifiers match the indexed public values', async (
   const id = await request('/recalls/search?q=F-2026-100');
   assert.deepEqual(id.body.recalls.map((recall) => recall.id), ['fda_event:100']);
   assert.equal(id.body.recalls[0].variants[0].id, 'fda:F-2026-100');
+  const longId = await request('/recalls/search?q=fda_press%3Afreshpoint-issues-recall-due-improperly-declared-allergen-egg-chicken-salad-wedge-sandwiches');
+  assert.deepEqual(longId.body.recalls.map((recall) => recall.id), ['fda_press:freshpoint-issues-recall-due-improperly-declared-allergen-egg-chicken-salad-wedge-sandwiches']);
 });
 
 test('search paginates grouped events and preserves the recalls response shape', async () => {
   const first = await request('/recalls/search?q=chicken&limit=1&offset=0');
   const next = await request('/recalls/search?q=chicken&limit=1&offset=1');
   assert.equal(first.body.grouping, 'event');
-  assert.equal(first.body.page.total, 3);
+  assert.equal(first.body.page.total, 4);
   assert.equal(first.body.page.returned, 1);
   assert.equal(first.body.page.has_more, true);
   assert.equal(first.body.page.next_offset, 1);
